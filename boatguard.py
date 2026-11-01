@@ -43,18 +43,44 @@ def save_json(p: Path, data) -> None:
     tmp = p.with_suffix(".tmp"); tmp.write_text(json.dumps(data, indent=2), encoding="utf-8"); tmp.replace(p)
 
 
-def router_stations(cfg: dict) -> set[str] | None:
-    """MAC addresses currently associated to the router's Wi-Fi, or None if the router could not be read."""
+def dur_text(s: float) -> str:
+    s = int(s); h, m = divmod(s // 60, 60)
+    return f"{h} h {m} min" if h else f"{m} min" if m else f"{s} s"
+
+
+class RouterError(Exception):
+    """The router's Wi-Fi clients could not be read. kind: "unreachable" (offline or restarting),
+    "auth" (the router refused the SSH key: needs action) or "other"."""
+    def __init__(self, kind: str, detail: str):
+        super().__init__(detail); self.kind, self.detail = kind, detail
+
+
+UNREACHABLE = ("connection refused", "timed out", "no route to host", "network is unreachable", "could not resolve",
+               "connection reset", "connection closed", "broken pipe", "host is down")
+AUTH = ("permission denied", "host key verification failed", "remote host identification has changed", "no such file")
+
+
+def classify_ssh_error(stderr: str) -> RouterError:
+    lines = [l for l in stderr.splitlines() if l.strip() and "post-quantum" not in l and "openssh.com/pq" not in l
+             and "upgraded" not in l.lower() and "vulnerable" not in l.lower()]
+    detail = lines[-1].strip() if lines else "no output"
+    low = stderr.lower()
+    if any(s in low for s in AUTH): return RouterError("auth", detail)
+    if any(s in low for s in UNREACHABLE) or not lines: return RouterError("unreachable", detail)
+    return RouterError("other", detail)
+
+
+def router_stations(cfg: dict) -> set[str]:
+    """MAC addresses currently associated to the router's Wi-Fi. Raises RouterError if the router can't be read."""
     r = cfg["router"]
     cmd = ["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", f"ConnectTimeout={r.get('timeout_s', 10)}",
            "-i", str(Path(r["key"]).expanduser()), f"{r['user']}@{r['host']}", STATION_CMD]
-    try: out = subprocess.run(cmd, capture_output=True, text=True, timeout=r.get("timeout_s", 10) + 20,
-                              stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout  # no console pop-up under pythonw
-    except (subprocess.TimeoutExpired, OSError) as e:
-        log.warning("router read failed: %s", e); return None
-    if "BOATGUARD_OK" not in out:
-        log.warning("router read failed (no output; SSH key wiped by a firmware update?)"); return None
-    return {m.lower() for m in MAC_RE.findall(out)}
+    try: res = subprocess.run(cmd, capture_output=True, text=True, timeout=r.get("timeout_s", 10) + 20,
+                              stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console pop-up under pythonw
+    except subprocess.TimeoutExpired: raise RouterError("unreachable", "no answer within the time limit") from None
+    except OSError as e: raise RouterError("other", f"ssh could not start: {e}") from None
+    if "BOATGUARD_OK" not in res.stdout: raise classify_ssh_error(res.stderr)
+    return {m.lower() for m in MAC_RE.findall(res.stdout)}
 
 
 class Camera:
@@ -139,6 +165,8 @@ class Guard:
         self.unguarded_sent = st.get("unguarded_sent", False)  # "left the boat with monitoring off" sent for this departure
         self.present: bool | None = None
         self.router_ok: bool | None = None
+        self.router_down: tuple[float, str, float] | None = None  # (since, kind, last logged) during an outage
+        self.router_error: str | None = None
         self.last_poll: float | None = None
         self.test_running = False
         self.cam_status: dict | None = None
@@ -179,9 +207,13 @@ class Guard:
         self.cam_status = dict(self.cam_status or {"battery": None, "online": None}, armed=armed, checked=now, error=None, pending=True)
 
     def tick(self) -> None:
-        seen = self.stations(self.cfg)
+        try:
+            seen, err = self.stations(self.cfg), None
+            if seen is None: err = RouterError("other", "no data")
+        except RouterError as e: seen, err = None, e
         with self.lock:
             now = self.clock(); self.last_poll, self.router_ok = now, seen is not None
+            self._router_log(err, now)
             if seen is None: return  # router unreadable: never arm or disarm on missing data
             if seen & self.phones:
                 if self.present is not True: log.info("phone on board")
@@ -199,6 +231,28 @@ class Guard:
                 self.unguarded_sent = True; self.save()
                 self.notify("unguarded", f"Phone off the boat Wi-Fi since {self.hm(self.last_seen)}. "
                             "The camera was NOT armed. Arm it in the EZVIZ app if you want it on.")
+
+    ROUTER_REMIND_S = 1800  # during a long outage, say it's still going on this often instead of on every poll
+
+    def _router_log(self, err: RouterError | None, now: float) -> None:
+        """One log line when the router becomes unreadable (or the reason changes), a reminder every
+        ROUTER_REMIND_S, and one line when it can be read again."""
+        down = self.router_down
+        if err is None:
+            if down: log.info("router readable again after %s", dur_text(now - down[0]))
+            self.router_down = self.router_error = None; return
+        self.router_error = {"auth": "router refused the SSH key", "unreachable": "router not reachable"}.get(err.kind, "router read failed")
+        if down and down[1] == err.kind:
+            if now - down[2] >= self.ROUTER_REMIND_S:
+                log.warning("router still not readable after %s (%s); nothing changed meanwhile", dur_text(now - down[0]), err.detail)
+                self.router_down = (down[0], err.kind, now)
+            return
+        msg = {"unreachable": "router not reachable (offline or restarting): %s. Nothing is changed until it's back",
+               "auth": "router refused the SSH key: %s. The key may have been removed by a firmware update; "
+                       "add it again on the router. Nothing is changed until then",
+               "other": "router read failed: %s. Nothing is changed until it works again"}[err.kind]
+        (log.error if err.kind == "auth" else log.warning)(msg, err.detail)
+        self.router_down = (down[0] if down else now, err.kind, now)
 
     def set_enabled(self, on: bool) -> None:
         """Monitoring off also disarms a camera BoatGuard armed (never one armed by hand)."""
@@ -304,7 +358,8 @@ class Guard:
     def status(self) -> dict:
         aa = self.cfg["away_after_s"]
         arm_at = self.last_seen + aa if self.enabled and self.present is False and not self.armed_by_us else None
-        return {"enabled": self.enabled, "present": self.present, "router_ok": self.router_ok, "last_poll": self.last_poll,
+        return {"enabled": self.enabled, "present": self.present, "router_ok": self.router_ok, "router_error": self.router_error,
+                "router_down_since": self.router_down[0] if self.router_down else None, "last_poll": self.last_poll,
                 "last_seen": self.last_seen, "away_after_s": aa, "poll_s": self.cfg.get("poll_s", 30), "now": self.clock(),
                 "armed_by_us": self.armed_by_us, "arm_at": arm_at, "test_running": self.test_running,
                 "limits": {k: list(v) for k, v in self.SETTINGS.items()},
@@ -370,8 +425,8 @@ def main(argv: list[str]) -> int:
     if cmd == "login": login(cfg)
     elif cmd == "pushover": return setup_pushover()
     elif cmd == "status":
-        seen = router_stations(cfg)
-        if seen is None: print("router not readable"); return 1
+        try: seen = router_stations(cfg)
+        except RouterError as e: print(f"router not readable ({e.kind}): {e.detail}"); return 1
         phones = {m.lower() for m in cfg["phone_macs"]}
         print(f"{len(seen)} Wi-Fi clients; phone {'ON BOARD' if seen & phones else 'NOT on Wi-Fi'}")
     elif cmd in ("arm", "disarm"): Camera(cfg).set_armed(cmd == "arm"); log.info("manual %s done", cmd)

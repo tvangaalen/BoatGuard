@@ -2,7 +2,7 @@
 import tempfile
 from pathlib import Path
 
-from boatguard import Guard
+from boatguard import Guard, RouterError, classify_ssh_error
 
 PHONE = "02:00:00:aa:bb:cc"
 CFG = {"phone_macs": [PHONE.upper()], "away_after_s": 300, "disarm_on_return": True, "test_settle_s": 0, "ezviz": {"camera_serial": "X"}}
@@ -140,6 +140,40 @@ def test():
             def send(self, *a, **k): raise RuntimeError("no internet")
         g3 = Guard(CFG, Cam(), stations=lambda c: set(), clock=lambda: t[0] + 1000, state_path=Path(tmp) / "b.json", notifier=Broken())
         g3.last_seen = 0; g3.tick(); assert g3.armed_by_us, "a notification failure never blocks arming"
+    # router failures: classified, logged once per outage (plus reminders), recovery logged, camera untouched
+    pq = "** WARNING: connection is not using a post-quantum key exchange algorithm.\n"
+    assert classify_ssh_error(pq + "ssh: connect to host 192.168.1.1 port 22: Connection refused").kind == "unreachable"
+    assert classify_ssh_error("ssh: connect to host 192.168.1.1 port 22: Connection timed out").kind == "unreachable"
+    assert classify_ssh_error(pq + "root@192.168.1.1: Permission denied (publickey,keyboard-interactive).").kind == "auth"
+    assert classify_ssh_error("Host key verification failed.").kind == "auth"
+    assert classify_ssh_error("").kind == "unreachable" and classify_ssh_error("weird").kind == "other"
+    import logging
+    class Cap(logging.Handler):
+        def __init__(self): super().__init__(); self.lines = []
+        def emit(self, r): self.lines.append((r.levelname, r.getMessage()))
+    cap = Cap(); lg = logging.getLogger("boatguard"); lg.addHandler(cap); lg.setLevel(logging.INFO)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            state, t = {"r": {PHONE}}, [0.0]
+            def stations(c):
+                if isinstance(state["r"], RouterError): raise state["r"]
+                return state["r"]
+            cam = Cam(); g = Guard(CFG, cam, stations=stations, clock=lambda: t[0], state_path=Path(tmp) / "s.json")
+            g.tick(); cap.lines.clear()
+            state["r"] = RouterError("unreachable", "Connection refused")
+            for _ in range(10): t[0] += 120; g.tick()  # 20 min outage
+            warns = [m for lv, m in cap.lines if "router" in m]
+            assert len(warns) == 1 and "offline or restarting" in warns[0], warns
+            assert g.status()["router_error"] == "router not reachable" and g.status()["router_down_since"] == 120
+            for _ in range(10): t[0] += 120; g.tick()  # past 30 min: one reminder
+            assert sum("still not readable" in m for _, m in cap.lines) == 1
+            state["r"] = RouterError("auth", "Permission denied (publickey)"); t[0] += 120; g.tick()
+            assert cap.lines[-1][0] == "ERROR" and "refused the SSH key" in cap.lines[-1][1], "a new reason is logged at once"
+            state["r"] = set(); t[0] += 120; g.tick()
+            assert any("router readable again after 42 min" in m for _, m in cap.lines), cap.lines[-2:]
+            assert g.status()["router_error"] is None and g.status()["router_down_since"] is None
+            assert cam.calls == [True], "outage changed nothing; only the real away-arm after recovery"
+    finally: lg.removeHandler(cap)
     print("boatguard self-test OK")
 
 

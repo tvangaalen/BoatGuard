@@ -153,7 +153,7 @@ function render() {
   else if (st.arm_at) { cls = "warn"; title = `Arming at ${hms(st.arm_at)}`; sub = `in ${dur(st.arm_at - now)} · phone away since ${hms(st.last_seen)}`; }
   else if (st.present) { title = "On board, monitoring ready"; sub = "The camera is armed once the phone leaves the boat"; }
   else { cls = "warn"; title = "Waiting for the first check…"; }
-  if (st.router_ok === false && st.enabled) { cls = "warn"; sub = "Router not reachable: nothing will be changed"; }
+  if (st.router_ok === false && st.enabled) { cls = "warn"; sub = `${st.router_error || "Router not readable"}: nothing will be changed`; }
   $("hero").className = "hero " + cls; $("heroTitle").textContent = title; $("heroSub").textContent = sub;
 
   $("phone").innerHTML = st.present === null ? "unknown" : st.present
@@ -164,7 +164,9 @@ function render() {
     : cam.pending ? `${cam.armed ? '<span class="badc">Armed</span>' : '<span class="good">Disarmed</span>'}<small>by BoatGuard ${hms(cam.checked)} · waiting for EZVIZ to confirm</small>`
     : `${cam.armed ? '<span class="badc">Armed</span>' : '<span class="good">Disarmed</span>'}<small>${cam.online === false ? "offline · " : ""}EZVIZ ${hms(cam.checked)}${!st.armed_by_us && cam.armed ? " · not by BoatGuard" : ""}</small>`;
   $("battery").innerHTML = cam.battery == null ? "–" : `<span class="${cam.battery < 20 ? "badc" : cam.battery < 40 ? "warnc" : ""}">${cam.battery}%</span>`;
-  $("router").innerHTML = st.router_ok === null ? "–" : `${st.router_ok ? '<span class="good">OK</span>' : '<span class="badc">Not reachable</span>'}<small>${st.last_poll ? "checked " + hms(st.last_poll) + ", every " + st.poll_s + " s" : ""}</small>`;
+  $("router").innerHTML = st.router_ok === null ? "–" : st.router_ok
+    ? `<span class="good">OK</span><small>checked ${hms(st.last_poll)}, every ${st.poll_s} s</small>`
+    : `<span class="badc">${esc(st.router_error || "Not readable")}</span><small>since ${hms(st.router_down_since || st.last_poll)}, last try ${hms(st.last_poll)}</small>`;
 
   $("notif").innerHTML = st.notifications ? '<span class="good">Pushover on</span><small>armed · disarmed · left with monitoring off</small>'
     : '<span class="warnc">Not set up</span><small>run boatguard.py pushover on the PC</small>';
