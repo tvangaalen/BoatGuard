@@ -1,3 +1,5 @@
+> **Archived on 1 November 2026.** This project continues as `modules/guard` in [DrifterBoatSystems](https://github.com/tvangaalen/DrifterBoatSystems/tree/main/modules/guard), with its full history and tags (`guard/vX.Y.Z`). This repository is read-only.
+
 # BoatGuard
 
 Arms an EZVIZ camera when your iPhone leaves the boat's Wi-Fi, and disarms it when the iPhone comes back. It runs on a Windows PC on board, has a small web page for the iPhone, and can send Pushover notifications.
